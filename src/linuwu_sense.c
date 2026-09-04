@@ -459,6 +459,9 @@ struct quirk_entry
     u8 nitro_v4;
     u8 nitro_sense;
     u8 four_zone_kb;
+    u8 predator_sense;
+    u8 platform_profile;
+    u8 fan_speed_read;
 };
 
 static struct quirk_entry *quirks;
@@ -474,27 +477,34 @@ static void __init set_quirks(void)
     if (quirks->turbo)
         interface->capability |= ACER_CAP_TURBO_OC | ACER_CAP_TURBO_LED | ACER_CAP_TURBO_FAN;
 
-    if (quirks->nitro_sense)
-        interface->capability |= ACER_CAP_PLATFORM_PROFILE | ACER_CAP_FAN_SPEED_READ | ACER_CAP_NITRO_SENSE;
+    if (quirks->platform_profile || quirks->predator_v4 ||
+        quirks->nitro_v4 || quirks->nitro_sense)
+        interface->capability |= ACER_CAP_PLATFORM_PROFILE;
 
-    if (quirks->predator_v4)
-        interface->capability |= ACER_CAP_PLATFORM_PROFILE |
-                                 ACER_CAP_FAN_SPEED_READ | ACER_CAP_PREDATOR_SENSE;
+    if (quirks->fan_speed_read || quirks->predator_v4 ||
+        quirks->nitro_v4 || quirks->nitro_sense)
+        interface->capability |= ACER_CAP_FAN_SPEED_READ;
+
+    if (quirks->predator_sense || quirks->predator_v4 || quirks->nitro_v4)
+        interface->capability |= ACER_CAP_PREDATOR_SENSE;
+
+    if (quirks->nitro_sense)
+        interface->capability |= ACER_CAP_NITRO_SENSE;
 
     if (quirks->nitro_v4)
-        interface->capability |= ACER_CAP_PLATFORM_PROFILE |
-                                 ACER_CAP_FAN_SPEED_READ | ACER_CAP_PREDATOR_SENSE | ACER_CAP_NITRO_SENSE_V4;
+        interface->capability |= ACER_CAP_NITRO_SENSE_V4;
 
-       if (enable_all) {
+    if (enable_all)
+    {
         quirks->four_zone_kb = 1;  // Enable four-zone keyboard
         interface->capability |= ACER_CAP_PLATFORM_PROFILE |
-                               ACER_CAP_FAN_SPEED_READ | 
-                               ACER_CAP_PREDATOR_SENSE |
-                               ACER_CAP_NITRO_SENSE |
-                               ACER_CAP_NITRO_SENSE_V4 |
-                               ACER_CAP_TURBO_OC |
-                               ACER_CAP_TURBO_LED |
-                               ACER_CAP_TURBO_FAN;
+                                 ACER_CAP_FAN_SPEED_READ |
+                                 ACER_CAP_PREDATOR_SENSE |
+                                 ACER_CAP_NITRO_SENSE |
+                                 ACER_CAP_NITRO_SENSE_V4 |
+                                 ACER_CAP_TURBO_OC |
+                                 ACER_CAP_TURBO_LED |
+                                 ACER_CAP_TURBO_FAN;
     }
 }
 
@@ -528,6 +538,22 @@ static struct quirk_entry quirk_acer_predator_ph315_53 = {
     .turbo = 1,
     .cpu_fans = 1,
     .gpu_fans = 1,
+};
+
+/*
+ * The PT315-53 uses the legacy Predator turbo key/fan topology, but also
+ * implements the newer Sense and platform-profile WMI methods.  Keep these
+ * capabilities explicit: setting predator_v4 would lose the fan topology and
+ * incorrectly describe the hardware generation.
+ */
+static struct quirk_entry quirk_acer_predator_pt315_53 = {
+    .turbo = 1,
+    .cpu_fans = 1,
+    .gpu_fans = 1,
+    .four_zone_kb = 1,
+    .predator_sense = 1,
+    .platform_profile = 1,
+    .fan_speed_read = 1,
 };
 
 static struct quirk_entry quirk_acer_predator_phn16_71 = {
@@ -810,6 +836,15 @@ static const struct dmi_system_id acer_quirks[] __initconst = {
             DMI_MATCH(DMI_PRODUCT_NAME, "Predator PH315-53"),
         },
         .driver_data = &quirk_acer_predator_ph315_53,
+    },
+    {
+        .callback = dmi_matched,
+        .ident = "Acer Predator PT315-53",
+        .matches = {
+            DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
+            DMI_MATCH(DMI_PRODUCT_NAME, "Predator PT315-53"),
+        },
+        .driver_data = &quirk_acer_predator_pt315_53,
     },
     {
         .callback = dmi_matched,
@@ -2495,7 +2530,7 @@ static int acer_platform_profile_setup(struct platform_device *device)
     int retry_delay_ms = 100;
     //int err;
 
-    if (quirks->predator_v4 || quirks->nitro_sense || quirks->nitro_v4 || enable_all)
+    if (has_cap(ACER_CAP_PLATFORM_PROFILE))
     {
         pr_info("Setting up platform profile for gaming laptop\n");
 
@@ -2558,7 +2593,7 @@ static int acer_thermal_profile_change(void)
      * This mode key can rotate each mode or toggle turbo mode.
      * On battery, only ECO and BALANCED mode are available.
      */
-    if (quirks->predator_v4 || quirks->nitro_sense || quirks->nitro_v4)
+    if (has_cap(ACER_CAP_PLATFORM_PROFILE))
     {
         u8 current_tp;
         int tp, err;
@@ -3334,6 +3369,15 @@ static acpi_status battery_health_query(int mode, int *enabled)
 
     ret = *((struct get_battery_health_control_status_output *)obj->buffer.pointer);
 
+    pr_info_once("Battery health capability bitmap: 0x%x\n",
+                 ret.uFunctionList);
+
+    if (!(ret.uFunctionList & mode))
+    {
+        pr_info("Battery health function %d is not supported\n", mode);
+        goto failed;
+    }
+
     if (mode == HEALTH_MODE)
     {
         *enabled = ret.uFunctionStatus[0];
@@ -3602,7 +3646,7 @@ static ssize_t predator_fan_speed_store(struct device *dev,
     char *token;
     char *input_ptr = input;
     size_t len = min(count, sizeof(input) - 1);
-    strncpy(input, buf, len);
+    memcpy(input, buf, len);
 
     if (input[len - 1] == '\n')
     {
@@ -3834,8 +3878,9 @@ static ssize_t predator_lcd_override_show(struct device *dev, struct device_attr
         return -ENODEV;
     }
     pr_info("lcd override get status: %llu\n", result);
-    return sprintf(buf, "%d\n", result == 0x1000001000000 ? 1 : result == 0x1000000 ? 0
-                                                                                    : -1);
+
+    /* Bit 48 is the overdrive state; the remaining response is firmware data. */
+    return sprintf(buf, "%d\n", !!(result & BIT_ULL(48)));
 }
 
 static ssize_t predator_lcd_override_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
@@ -3866,6 +3911,7 @@ static ssize_t predator_backlight_timeout_show(struct device *dev, struct device
 {
     acpi_status status;
     u64 result;
+    u64 normalized_result;
     status = WMI_apgeaction_execute_u64(ACER_WMID_GET_FUNCTION, 0x88401, &result);
     if (ACPI_FAILURE(status))
     {
@@ -3873,8 +3919,13 @@ static ssize_t predator_backlight_timeout_show(struct device *dev, struct device
         return -ENODEV;
     }
     pr_info("backlight_timeout get status: %llu\n", result);
-    return sprintf(buf, "%d\n", result == 0x1E0000080000 ? 1 : result == 0x80000 ? 0
-                                                                                 : -1);
+
+    /* Some firmware includes unrelated data in byte 4 of the response. */
+    normalized_result = result & ~GENMASK_ULL(39, 32);
+
+    return sprintf(buf, "%d\n",
+                   normalized_result == 0x1E0000080000 ? 1 :
+                   normalized_result == 0x80000 ? 0 : -1);
 }
 
 static ssize_t predator_backlight_timeout_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
@@ -4104,7 +4155,7 @@ static ssize_t four_zoned_rgb_kb_store(struct device *dev, struct device_attribu
     char *input_ptr = input_buf;
     size_t len = min(count, sizeof(input_buf) - 1);
 
-    strncpy(input_buf, buf, len);
+    memcpy(input_buf, buf, len);
 
     if (input_buf[len - 1] == '\n')
     {
@@ -4297,7 +4348,7 @@ static ssize_t per_zoned_rgb_kb_store(struct device *dev, struct device_attribut
     struct per_zone_color colors;
     char *input_ptr = str_buf;
     len = min(count, sizeof(str_buf) - 1);
-    strncpy(str_buf, buf, len);
+    memcpy(str_buf, buf, len);
     if (str_buf[len - 1] == '\n')
     {
         str_buf[len - 1] = '\0';
@@ -4566,12 +4617,12 @@ static void acer_platform_remove(struct platform_device *device)
         acer_led_exit();
     if (has_cap(ACER_CAP_BRIGHTNESS))
         acer_backlight_exit();
-    if (has_cap(ACER_CAP_PREDATOR_SENSE) & !has_cap(ACER_CAP_NITRO_SENSE_V4))
+    if (has_cap(ACER_CAP_PREDATOR_SENSE) && !has_cap(ACER_CAP_NITRO_SENSE_V4))
     {
         sysfs_remove_group(&device->dev.kobj, &preadtor_sense_attr_group);
         acer_predator_state_save();
     }
-    if (has_cap(ACER_CAP_PREDATOR_SENSE) & has_cap(ACER_CAP_NITRO_SENSE_V4))
+    if (has_cap(ACER_CAP_PREDATOR_SENSE) && has_cap(ACER_CAP_NITRO_SENSE_V4))
     {
         sysfs_remove_group(&device->dev.kobj, &nitro_sense_v4_attr_group);
         acer_predator_state_save();
@@ -4892,7 +4943,7 @@ static int __init acer_wmi_init(void)
     if (wmi_has_guid(WMID_GUID3))
         interface->capability |= ACER_CAP_SET_FUNCTION_MODE;
 
-    if (enable_all || predator_v4 || nitro_v4)
+    if (enable_all)
     {
         interface->capability |= ACER_CAP_PLATFORM_PROFILE |
                                  ACER_CAP_FAN_SPEED_READ |
@@ -4902,6 +4953,22 @@ static int __init acer_wmi_init(void)
                                  ACER_CAP_TURBO_OC |
                                  ACER_CAP_TURBO_LED |
                                  ACER_CAP_TURBO_FAN;
+    }
+    else if (predator_v4)
+    {
+        interface->capability |= ACER_CAP_PLATFORM_PROFILE |
+                                 ACER_CAP_FAN_SPEED_READ |
+                                 ACER_CAP_PREDATOR_SENSE |
+                                 ACER_CAP_TURBO_OC |
+                                 ACER_CAP_TURBO_LED |
+                                 ACER_CAP_TURBO_FAN;
+    }
+    else if (nitro_v4)
+    {
+        interface->capability |= ACER_CAP_PLATFORM_PROFILE |
+                                 ACER_CAP_FAN_SPEED_READ |
+                                 ACER_CAP_PREDATOR_SENSE |
+                                 ACER_CAP_NITRO_SENSE_V4;
     }
 
     if (force_caps != -1)
